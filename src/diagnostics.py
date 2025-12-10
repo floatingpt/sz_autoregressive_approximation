@@ -30,7 +30,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from data.load_npy_dat import get_np_dir, load_test
-from train import vectorized_var_features, select_var_order_bic
+from train import vectorized_var_features, select_global_var_order_pacf, autocorr, pacf_yw
 
 
 def ensure_dirs():
@@ -59,8 +59,8 @@ def plot_roc(y_true, y_score, classes, out_path):
         aucs[str(cls)] = float(roc_auc)
         plt.plot(fpr, tpr, lw=2, label=f"class {cls} (AUC = {roc_auc:.3f})")
 
-    # micro-average
-    if y_bin.size > 0:
+    # micro-average: only when score shape matches binarized labels
+    if y_bin.size > 0 and y_score.shape[1] == y_bin.shape[1]:
         fpr, tpr, _ = roc_curve(y_bin.ravel(), y_score.ravel())
         roc_auc = auc(fpr, tpr)
         aucs["micro"] = float(roc_auc)
@@ -157,15 +157,52 @@ def plot_calibration(y_true, y_score, classes, out_path, n_bins=10):
     plt.close()
     return calib_stats
 
-def plot_bic_distribution(p_values, out_path):
-    plt.figure(figsize=(6,4))
-    plt.hist(p_values, bins=np.arange(1, max(p_values)+2), edgecolor='black')
+def plot_pacf_distribution(p_values, out_path):
+    """Plot distribution of PACF-selected VAR orders"""
+    plt.figure(figsize=(6, 4))
+    plt.hist(p_values, bins=np.arange(1, max(p_values) + 2) - 0.5, edgecolor='black', alpha=0.7)
     plt.xlabel("Selected VAR order p")
     plt.ylabel("Count")
-    plt.title("Distribution of BIC-selected VAR orders")
+    plt.title("Distribution of PACF-selected VAR orders")
+    plt.xticks(np.arange(1, max(p_values) + 1))
+    plt.grid(axis='y', alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
+
+
+def compute_pacf_orders_test(x_test, p_max=12):
+    """Compute PACF-based VAR orders for each test sample"""
+    from collections import Counter
+    p_vals = []
+    z = 1.96  # 95% confidence
+    
+    for i, X in enumerate(x_test):
+        if X.shape[1] < 10:
+            p_vals.append(1)
+            continue
+        
+        T = X.shape[1]
+        thresh = z / np.sqrt(T)
+        per_channel_p = []
+        
+        for ch in range(X.shape[0]):
+            series = X[ch]
+            pacf_vals = pacf_yw(series, p_max)
+            sig_lags = [lag for lag in range(1, len(pacf_vals)) if abs(pacf_vals[lag]) > thresh]
+            
+            if len(sig_lags) == 0:
+                per_channel_p.append(1)
+            else:
+                per_channel_p.append(min(max(sig_lags), p_max))
+        
+        if len(per_channel_p) > 0:
+            p_i = int(max(per_channel_p))
+            p_vals.append(p_i)
+        else:
+            p_vals.append(1)
+    
+    return p_vals
 
 
 
@@ -204,6 +241,10 @@ def main():
     np_files = get_np_dir()
     x_test, y_test = load_test(np_files)
 
+    # Use differenced series and binary seizure labels to match training pipeline
+    x_test_diff = np.diff(x_test, axis=2)
+    y_test_bin = (y_test != 0).astype(int)
+
     # Decide which VAR order `p` to use for feature extraction.
     # Prefer an explicit saved `p` in the model, otherwise try to infer it from the saved PCA input size.
     saved_p = model.get('p', None)
@@ -227,8 +268,8 @@ def main():
         p_used = 5
         print(f"No saved/inferred VAR order found; defaulting to p={p_used}")
 
-    print(f'Computing VAR features for test set with p={p_used}...')
-    Xf_test = vectorized_var_features(x_test, p=p_used, verbose=True)
+    print(f'Computing VAR features for test set with p={p_used} (differenced series)...')
+    Xf_test = vectorized_var_features(x_test_diff, p=p_used, verbose=True)
     if pca is not None:
         # defensive check: ensure PCA was fitted on same number of features
         n_in = getattr(pca, "n_features_in_", None)
@@ -266,53 +307,66 @@ def main():
 
     y_pred = clf.predict(Xf_test_p)
 
-    # Encode / map test labels to the training label space
+    # Diagnostics: how many positives are being predicted and score range
+    if hasattr(clf, "classes_") and len(clf.classes_) == 2:
+        pos_idx = list(clf.classes_).index(1)
+        pos_scores = y_score[:, pos_idx]
+        print(f"Prediction summary: predicted positives = {(y_pred==1).sum()} / {len(y_pred)}")
+        print(f"Positive class score stats: min={pos_scores.min():.4f}, max={pos_scores.max():.4f}, mean={pos_scores.mean():.4f}")
+    else:
+        print(f"Prediction summary: class counts = {np.bincount(y_pred.astype(int))}")
+
+    # Encode / map test labels to the training label space (binary)
     if le is not None:
         try:
-            y_test_enc = le.transform(y_test)
+            y_test_enc = le.transform(y_test_bin)
         except Exception:
             # Best-effort mapping: if unique test labels count matches classes, map by order
-            uniq = np.unique(y_test)
+            uniq = np.unique(y_test_bin)
             if len(uniq) == len(clf.classes_):
                 mapping = {orig: enc for orig, enc in zip(uniq, clf.classes_)}
-                y_test_enc = np.array([mapping[v] for v in y_test])
+                y_test_enc = np.array([mapping[v] for v in y_test_bin])
             else:
-                # try numeric coercion
                 try:
-                    y_test_enc = y_test.astype(int)
+                    y_test_enc = y_test_bin.astype(int)
                 except Exception:
                     raise RuntimeError('Could not map test labels to training label encoding. Retrain saving the LabelEncoder or provide matching labels.')
     else:
-        # assume y_test already matches the encoding used in training
-        y_test_enc = y_test
+        y_test_enc = y_test_bin
 
-    classes = np.unique(np.concatenate([y_test_enc, y_pred]))
+    # Ensure both binary classes are present for metrics shapes
+    if hasattr(clf, 'classes_') and len(clf.classes_) == 2:
+        classes = np.array(clf.classes_)
+    else:
+        classes = np.unique(np.concatenate([y_test_enc, y_pred]))
 
     results = {}
-    # If using BIC in training, recompute p-values for test set
-    p_vals = []
-    for Xi in x_test:
-        p_i, _ = select_var_order_bic(Xi, p_max=12)
-        p_vals.append(p_i)
+    
+    # Compute PACF-based VAR orders for test set (matches training approach)
+    print('Computing PACF-selected VAR orders for test samples...')
+    p_vals = compute_pacf_orders_test(x_test_diff, p_max=12)
+    results['pacf_selected_orders'] = p_vals
+    
+    # Plot distribution
+    plot_pacf_distribution(p_vals, out_dir / 'pacf_distribution.png')
+    print(f'  PACF order distribution: min={min(p_vals)}, max={max(p_vals)}, '
+          f'mean={np.mean(p_vals):.2f}, median={np.median(p_vals):.0f}')
 
-    results['bic_selected_orders'] = p_vals
-
-    plot_bic_distribution(p_vals, out_dir / 'bic_distribution.png')
     print('Plotting ROC...')
-    results['roc_aucs'] = plot_roc(y_test, y_score, classes, out_dir / 'roc.png')
+    results['roc_aucs'] = plot_roc(y_test_enc, y_score, classes, out_dir / 'roc.png')
 
     print('Plotting Precision-Recall...')
-    results['pr_aps'] = plot_pr(y_test, y_score, classes, out_dir / 'pr.png')
+    results['pr_aps'] = plot_pr(y_test_enc, y_score, classes, out_dir / 'pr.png')
 
     print('Plotting Confusion Matrix...')
-    results['confusion_matrix'] = plot_confusion(y_test, y_pred, classes, out_dir / 'confusion.png')
+    results['confusion_matrix'] = plot_confusion(y_test_enc, y_pred, classes, out_dir / 'confusion.png')
 
     print('Plotting Calibration Curve...')
-    results['calibration'] = plot_calibration(y_test, y_score, classes, out_dir / 'calibration.png')
+    results['calibration'] = plot_calibration(y_test_enc, y_score, classes, out_dir / 'calibration.png')
 
     print('Plotting Coefficient Summary...')
     coef_summary(clf, out_dir / 'coeffs.png')
-    report = classification_report(y_test, y_pred, output_dict=True)
+    report = classification_report(y_test_enc, y_pred, output_dict=True, zero_division=0)
     results['classification_report'] = report
 
     # write summary

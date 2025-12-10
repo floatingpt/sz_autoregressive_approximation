@@ -7,7 +7,7 @@ import joblib
 import scipy as sc
 
 
-def fit_var_window(X_window, p=5): # (electrode channel x sample)
+def fit_var_window(X_window, p): # (electrode channel x sample)
     
    
     data = X_window.T  # 
@@ -38,7 +38,7 @@ def fit_var_window(X_window, p=5): # (electrode channel x sample)
         used_p = p
     return A, Sigma, used_p
 
-def var_features_from_A_Sigma(A_list, Sigma):
+def var_features_from_A_Var(A_list, Sigma):
     # flatten coefficients
     if len(A_list) > 0:
         coeff_vec = np.concatenate([A.flatten() for A in A_list])
