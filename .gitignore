@@ -6,3 +6,9 @@ __pycache__
 *.pyc
 *.pyo
 .pytest_cache
+
+siena-scalp-eeg-database-1.0.0/**/*
+paths.yaml
+
+artifacts/**/*
+results/**/*
