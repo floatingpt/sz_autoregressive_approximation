@@ -10,5 +10,7 @@ __pycache__
 siena-scalp-eeg-database-1.0.0/**/*
 paths.yaml
 
-artifacts/**/*
-results/**/*
+artifacts/**/*.npy
+results/**/*.json
+results/**/*.png
+results/**/*.pkl
