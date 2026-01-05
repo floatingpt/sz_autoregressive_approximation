@@ -16,3 +16,4 @@ artifacts/*.json
 results/**/*.json
 results/**/*.png
 results/**/*.pkl
+figures/**/*.png
