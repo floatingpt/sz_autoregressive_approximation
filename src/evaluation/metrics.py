@@ -16,6 +16,7 @@ from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
     roc_auc_score,
+    average_precision_score,
     roc_curve,
     confusion_matrix,
     classification_report,
@@ -51,6 +52,7 @@ def compute_comprehensive_metrics(
         - recall_nonseizure: Recall (specificity) for non-seizure class
         - f1_nonseizure: F1 score for non-seizure class
         - roc_auc: ROC-AUC score (if probabilities provided)
+        - pr_auc:  Precision-Recall AUC (Average Precision) if probabilities provided
     """
     metrics = {}
     
@@ -88,6 +90,12 @@ def compute_comprehensive_metrics(
             metrics['roc_auc'] = roc_auc_score(y_true, y_proba_pos)
         except ValueError:
             metrics['roc_auc'] = np.nan
+
+        # Average Precision (PR-AUC)
+        try:
+            metrics['pr_auc'] = average_precision_score(y_true, y_proba_pos)
+        except ValueError:
+            metrics['pr_auc'] = np.nan
             
     return metrics
 
@@ -210,6 +218,8 @@ def print_evaluation_report(
     print(f"  Accuracy:     {metrics.get('accuracy', 0):.4f}")
     if 'roc_auc' in metrics and not np.isnan(metrics['roc_auc']):
         print(f"  ROC-AUC:      {metrics['roc_auc']:.4f}")
+    if 'pr_auc' in metrics and not np.isnan(metrics['pr_auc']):
+        print(f"  PR-AUC:       {metrics['pr_auc']:.4f}")
     
     # Clinical metrics
     print(f"\nClinical Metrics:")

@@ -47,8 +47,17 @@ def load_preprocessed_data(
         manifest = json.load(f)
     
     # Extract shape information from manifest
-    n_train = 2 * manifest['train_per_class']
-    n_test = 2 * manifest['test_per_class']
+    # Support two manifest formats: balanced (with train_per_class/test_per_class)
+    # and legacy (with explicit n_train/n_test).
+    if (
+        'train_per_class' in manifest and manifest.get('train_per_class') is not None
+        and 'test_per_class' in manifest and manifest.get('test_per_class') is not None
+    ):
+        n_train = 2 * manifest['train_per_class']
+        n_test = 2 * manifest['test_per_class']
+    else:
+        n_train = manifest.get('n_train')
+        n_test = manifest.get('n_test')
     n_channels = manifest['n_channels']
     win_samples = int(manifest['window_sec'] * manifest['sample_rate'])
     

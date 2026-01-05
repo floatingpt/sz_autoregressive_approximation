@@ -418,11 +418,43 @@ class MVARBinaryClassifier:
     """
     Binary classifier for multivariate time series based on MVAR features.
     
-    Classification Algorithm:
-    1. Extract feature S_k for each training series
-    2. Compute class medians μ̂_1, μ̂_2
-    3. Find threshold τ* maximizing training accuracy
-    4. Classify new series: ŷ = argmin_c |S - μ̂_c|
+    Implements Algorithm 1: Binary structural classification procedure
+    
+    Classification Algorithm (from Algorithm 1):
+    ---------------------------------------------
+    Step 1: For training time series {x_k1} (class 1) and {y_k2} (class 2),
+            compute aggregated discriminative features S^x_k1, S^y_k2 based on
+            temporal variation in MVAR coefficient matrices:
+            
+            For each series k and lag j:
+              D_k(j) = sup_{t1,t2 ∈ [0,1]} ||Â_j^k(t1) - Â_j^k(t2)||
+            
+            Aggregate over upper lags:
+              S_k = sup_{j ∈ upper-lag range} D_k(j)
+            
+            Compute average features:
+              S̄_x = median({S^x_k1})
+              S̄_y = median({S^y_k2})
+    
+    Step 2: Compute threshold value ϑ that maximizes training accuracy.
+    
+    Step 3: For test series z, compute aggregated discriminative feature S^z.
+    
+    Step 4: Classification rule based on threshold and class averages:
+            - If S^z < ϑ:
+                * Assign to class 1 when S̄_x < S̄_y
+                * Assign to class 2 when S̄_x > S̄_y
+            - If S^z > ϑ:
+                * Assign to class 2 when S̄_x < S̄_y  
+                * Assign to class 1 when S̄_x > S̄_y
+    
+    Multiple Channel Handling:
+    --------------------------
+    The multivariate AR model captures dependencies across all p channels:
+    - Z_t ∈ R^p represents all channels at time t
+    - Coefficient matrices A_j(t) ∈ R^{p×p} encode cross-channel dynamics
+    - Matrix norms measure joint variation across all channel interactions
+    - Features aggregate information from the full p×p coefficient structure
     """
     
     def __init__(
@@ -435,6 +467,8 @@ class MVARBinaryClassifier:
         norm_type: Literal['fro', 'spectral', 'operator'] = 'fro',
         n_time_points: int = 50,
         n_grid_points: int = 100,
+        threshold_metric: Literal['f1_seizure', 'youden'] = 'f1_seizure',
+        seizure_weight: float | None = None,
     ):
         """
         Parameters
@@ -466,21 +500,24 @@ class MVARBinaryClassifier:
             n_time_points=n_time_points,
         )
         self.n_grid_points = n_grid_points
+        self.threshold_metric = threshold_metric
+        self.seizure_weight = seizure_weight
         
-        # Learned parameters
-        self.class_medians_ = None  # {0: μ̂_0, 1: μ̂_1}
-        self.threshold_ = None
-        self.train_features_ = None
+        # Learned parameters (Algorithm 1 notation)
+        self.class_averages_ = None  # S̄_x (class 0) and S̄_y (class 1)
+        self.threshold_ = None  # ϑ
+        self.train_features_ = None  # {S^x_k1, S^y_k2}
         self.train_labels_ = None
+        self.label_order_ = None  # Track which class has lower average
         
     def fit(self, X: np.ndarray, y: np.ndarray) -> MVARBinaryClassifier:
         """
-        Fit classifier on training data.
+        Fit classifier on training data following Algorithm 1.
         
         Parameters
         ----------
         X : ndarray, shape (n_samples, p, T) or (n_samples, T, p)
-            Training time series
+            Training time series. Multiple channels (p) capture EEG/multivariate data.
         y : ndarray, shape (n_samples,)
             Binary labels {0, 1}
             
@@ -490,10 +527,12 @@ class MVARBinaryClassifier:
         """
         n_samples = X.shape[0]
         
-        # Extract features for all training series
-        print("Extracting MVAR features from training data...")
+        # Step 1: Extract aggregated discriminative features S_k for each series
+        print("Step 1: Extracting MVAR features from training data...")
+        print(f"  Series shape: {X[0].shape} (channels × time or time × channels)")
         features = np.zeros(n_samples)
         for i in range(n_samples):
+            # Feature extraction captures cross-channel dynamics via p×p matrices
             features[i] = self.feature_extractor.extract_features(X[i])
             if (i + 1) % 10 == 0:
                 print(f"  Processed {i + 1}/{n_samples} series")
@@ -501,80 +540,146 @@ class MVARBinaryClassifier:
         self.train_features_ = features
         self.train_labels_ = y
         
-        # Compute class medians (robust to outliers)
-        self.class_medians_ = {
-            0: np.median(features[y == 0]),
-            1: np.median(features[y == 1]),
+        # Compute class average features S̄_x and S̄_y (using median for robustness)
+        features_class0 = features[y == 0]
+        features_class1 = features[y == 1]
+        
+        self.class_averages_ = {
+            0: np.median(features_class0),  # S̄_x (or S̄_y depending on labeling)
+            1: np.median(features_class1),
         }
         
-        print(f"\nClass medians: {self.class_medians_}")
+        # Track ordering: which class has lower average feature value
+        self.label_order_ = 'ascending' if self.class_averages_[0] < self.class_averages_[1] else 'descending'
         
-        # Find optimal threshold via grid search
+        print(f"\nClass average features (S̄):")
+        print(f"  Class 0: {self.class_averages_[0]:.4f}")
+        print(f"  Class 1: {self.class_averages_[1]:.4f}")
+        print(f"  Order: {self.label_order_}")
+        
+        # Step 2: Find optimal threshold ϑ via grid search (maximizes training accuracy)
+        print("\nStep 2: Finding optimal threshold ϑ...")
         feature_min = features.min()
         feature_max = features.max()
         thresholds = np.linspace(feature_min, feature_max, self.n_grid_points)
         
-        best_acc = 0.0
-        best_thresh = None
-        
+        best_score = -np.inf
+        best_thresh = thresholds[0]
+
+        def _score(pred: np.ndarray, y_true: np.ndarray) -> float:
+            tp = np.sum((pred == 1) & (y_true == 1))
+            fp = np.sum((pred == 1) & (y_true == 0))
+            fn = np.sum((pred == 0) & (y_true == 1))
+            tn = np.sum((pred == 0) & (y_true == 0))
+
+            # Avoid div-by-zero
+            precision = tp / (tp + fp + 1e-9)
+            recall = tp / (tp + fn + 1e-9)
+            f1_seiz = 2 * precision * recall / (precision + recall + 1e-9)
+
+            sens = recall  # seizure recall
+            spec = tn / (tn + fp + 1e-9)
+            youden = sens + spec - 1
+
+            if self.threshold_metric == 'youden':
+                if self.seizure_weight is not None:
+                    # weighted version: w*sens + (1-w)*spec
+                    w = self.seizure_weight
+                    return w * sens + (1 - w) * spec
+                return youden
+            # default: f1_seizure
+            if self.seizure_weight is not None:
+                # small bias toward seizure recall
+                return f1_seiz + self.seizure_weight * sens * 0.01
+            return f1_seiz
+
         for thresh in thresholds:
-            # Classify based on distance to class medians
-            pred = np.where(
-                np.abs(features - self.class_medians_[0]) < 
-                np.abs(features - self.class_medians_[1]),
-                0, 1
-            )
-            acc = np.mean(pred == y)
-            
-            if acc > best_acc:
-                best_acc = acc
+            pred = self._classify_by_threshold(features, thresh)
+            score = _score(pred, y)
+            if score > best_score:
+                best_score = score
                 best_thresh = thresh
                 
         self.threshold_ = best_thresh
         
-        print(f"Optimal threshold: {self.threshold_:.4f}")
-        print(f"Training accuracy: {best_acc:.4f}")
+        print(f"  Optimal threshold ϑ: {self.threshold_:.4f}")
+        print(f"  Training {self.threshold_metric} score: {best_score:.4f}")
         
         return self
     
+    def _classify_by_threshold(self, features: np.ndarray, threshold: float) -> np.ndarray:
+        """
+        Apply Algorithm 1 Step 4 classification rule.
+        
+        Classification logic:
+        - If S < ϑ: assign to class with lower average
+        - If S > ϑ: assign to class with higher average
+        
+        Parameters
+        ----------
+        features : ndarray
+            Feature values S for samples
+        threshold : float
+            Threshold value ϑ
+            
+        Returns
+        -------
+        predictions : ndarray
+            Predicted class labels {0, 1}
+        """
+        predictions = np.zeros(len(features), dtype=int)
+        
+        # Determine which class to assign based on feature value relative to threshold
+        if self.label_order_ == 'ascending':
+            # Class 0 has lower average, class 1 has higher average
+            # S < ϑ → class 0, S > ϑ → class 1
+            predictions = (features > threshold).astype(int)
+        else:
+            # Class 0 has higher average, class 1 has lower average
+            # S < ϑ → class 1, S > ϑ → class 0
+            predictions = (features < threshold).astype(int)
+            
+        return predictions
+    
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
-        Predict class labels for new time series.
+        Predict class labels for new time series (Algorithm 1 Steps 3-4).
         
         Parameters
         ----------
         X : ndarray, shape (n_samples, p, T) or (n_samples, T, p)
-            Test time series
+            Test time series with p channels
             
         Returns
         -------
         y_pred : ndarray, shape (n_samples,)
             Predicted binary labels
         """
-        if self.class_medians_ is None:
+        if self.class_averages_ is None:
             raise ValueError("Classifier must be fitted first")
             
         n_samples = X.shape[0]
         features = np.zeros(n_samples)
         
-        print(f"Extracting features from {n_samples} test series...")
+        # Step 3: Compute aggregated discriminative feature S^z for each test series
+        print(f"Step 3: Extracting features from {n_samples} test series...")
         for i in range(n_samples):
             features[i] = self.feature_extractor.extract_features(X[i])
             if (i + 1) % 10 == 0:
                 print(f"  Processed {i + 1}/{n_samples} series")
-                
-        # Classify based on distance to class medians
-        y_pred = np.where(
-            np.abs(features - self.class_medians_[0]) < 
-            np.abs(features - self.class_medians_[1]),
-            0, 1
-        )
+        
+        # Step 4: Apply threshold-based classification rule
+        print(f"Step 4: Classifying based on threshold ϑ = {self.threshold_:.4f}...")
+        y_pred = self._classify_by_threshold(features, self.threshold_)
         
         return y_pred
     
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """
-        Predict class probabilities (soft assignment based on distance).
+        Predict class probabilities (soft assignment based on distance to threshold).
+        
+        Uses distance from feature value to threshold, normalized by distance
+        to class averages, to create probabilistic predictions.
         
         Parameters
         ----------
@@ -586,7 +691,7 @@ class MVARBinaryClassifier:
         proba : ndarray, shape (n_samples, 2)
             Class probabilities
         """
-        if self.class_medians_ is None:
+        if self.class_averages_ is None:
             raise ValueError("Classifier must be fitted first")
             
         n_samples = X.shape[0]
@@ -594,15 +699,20 @@ class MVARBinaryClassifier:
         
         for i in range(n_samples):
             features[i] = self.feature_extractor.extract_features(X[i])
-            
-        # Distance-based soft assignment
-        dist_0 = np.abs(features - self.class_medians_[0])
-        dist_1 = np.abs(features - self.class_medians_[1])
         
-        # Convert to probabilities via softmax of negative distances
-        total_dist = dist_0 + dist_1
+        # Soft assignment based on distance to class averages
+        dist_0 = np.abs(features - self.class_averages_[0])
+        dist_1 = np.abs(features - self.class_averages_[1])
+        total_dist = dist_0 + dist_1 + 1e-10
         proba = np.zeros((n_samples, 2))
-        proba[:, 0] = dist_1 / (total_dist + 1e-10)
-        proba[:, 1] = dist_0 / (total_dist + 1e-10)
+
+        if self.label_order_ == 'ascending':
+            # class 0 has lower average
+            proba[:, 0] = dist_1 / total_dist
+            proba[:, 1] = dist_0 / total_dist
+        else:
+            # class 1 has lower average
+            proba[:, 1] = dist_0 / total_dist
+            proba[:, 0] = dist_1 / total_dist
         
         return proba

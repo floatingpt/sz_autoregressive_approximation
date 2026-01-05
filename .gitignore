@@ -11,6 +11,8 @@ siena-scalp-eeg-database-1.0.0/**/*
 paths.yaml
 
 artifacts/**/*.npy
+artifacts/logs/*.log
+artifacts/*.json
 results/**/*.json
 results/**/*.png
 results/**/*.pkl
