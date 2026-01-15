@@ -222,7 +222,7 @@ class TimeVaryingMVAR:
                 ridge.fit(X_design, y[:, out_ch])
                 theta = ridge.coef_
             else:
-                # OLS solution
+                # OLS solution -> consider penalty term
                 theta = linalg.lstsq(X_design, y[:, out_ch])[0]
             
             # Reshape theta back to (order, p, n_basis)
